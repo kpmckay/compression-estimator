@@ -14,9 +14,7 @@ would be achieved on a ScaleFlux device with transparent compression. As such,
 the utility compresses on 4KB boundaries and emulates compression bypass so that
 the data size does not grow for incompressible data. The number of threads
 strongly influences performance as per-core zlib is fairly slow, but with a
-sufficiently high number of threads, throughput can saturate Gen3 x4. This
-utility is intended to be run on non-ScaleFlux devices for customer evaluation,
-but the following sample is run against a CSD 2000.
+sufficiently high number of threads, throughput can saturate Gen3 x4.
 
 ## Sample Output (Block Device Scan)
 ```
