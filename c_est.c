@@ -8,8 +8,8 @@
 #include <stdint.h>
 #include <malloc.h>
 #include <pthread.h>
-#include <dirent.h>
 #include <ftw.h>
+#include <math.h>
 
 #include <linux/fs.h>
 #include <sys/ioctl.h>
@@ -28,11 +28,14 @@ int32_t  threadpool;
 uint32_t thread_cnt = 1;
 uint64_t dirmode_bytes = 0;
 uint64_t dirmode_files = 0;
+uint8_t  quantized_compression = 0;
+uint8_t  measure_entropy = 0;
+uint64_t symbol_table[256] = {0};
 
 pthread_mutex_t bucket_mutex;
 pthread_mutex_t status_mutex;
 pthread_mutex_t threadpool_mutex;
-pthread_mutex_t threadpool_create_mutex;
+pthread_mutex_t symbol_table_mutex;
 
 typedef struct {
    int32_t fd;
@@ -49,7 +52,6 @@ typedef struct {
 static volatile sig_atomic_t run = 1;
 static void signal_handler(int _) {
    (void)_;
-   fprintf(stderr, "\rTerminating on ctrl-c...\n");
    run = 0;
 }
 
@@ -62,15 +64,16 @@ void* monitor_thread(void* t_ops) {
 
    while (run) {
 
-      if ( ops.dirmode ) {
-         fprintf(stderr, "\r%.1f GiB Completed (%ld files) with %d threads active", (status*1.0) / (1024*1024*1024), \
-         dirmode_files, threadpool);      
-      } else {
-         fprintf(stderr, "\r%.1f GiB Completed (%.1f%%) [%lu MiB/s]", (status*1.0) / (1024*1024*1024), \
-         ((status*1.0) / ops.bytes)*100, (status - bytes_prev) / (1024*1024)); 
-      }
-
-      bytes_prev = status;
+      pthread_mutex_lock(&status_mutex);
+         if ( ops.dirmode ) {
+            fprintf(stderr, "\r%.1f GiB Completed (%ld files) with %d threads active", (status*1.0) / (1024*1024*1024), \
+            dirmode_files, threadpool);      
+         } else {
+            fprintf(stderr, "\r%.1f GiB Completed (%.1f%%) [%lu MiB/s]", (status*1.0) / (1024*1024*1024), \
+            ((status*1.0) / ops.bytes)*100, (status - bytes_prev) / (1024*1024)); 
+         }
+         bytes_prev = status;
+      pthread_mutex_unlock(&status_mutex);
       sleep(1);
    }
    return NULL;
@@ -99,6 +102,12 @@ void* compress_thread(void* t_ops) {
 
    if (!ibuff || !zbuff || !obuff) {
       fprintf(stderr, "Error allocating buffers\n");
+      if (ibuff)
+         free(ibuff);
+      if (obuff)
+         free(obuff);
+      if (zbuff)   
+         free(zbuff);
       return NULL;
    }
 
@@ -115,7 +124,6 @@ void* compress_thread(void* t_ops) {
 
       // Break up preads into 128kB units (if we need to read more than 128kB)
       bytes_to_pread = bytes_this_pass = (bytes >= (128*1024) ? (128*1024) : bytes);
-
       bytes_in_pread = 0;
       while (bytes_to_pread) {
          bytes_in_pread = pread(fd, ibuff+bytes_in_pread, bytes_to_pread, offset+bytes_in_pread);
@@ -128,6 +136,14 @@ void* compress_thread(void* t_ops) {
 
       offset += bytes_this_pass;
       bytes  -= bytes_this_pass;
+
+      if (measure_entropy) {
+         pthread_mutex_lock(&symbol_table_mutex);
+            for ( i = 0; i < bytes_this_pass; i++ ) {
+                symbol_table[ibuff[i]]++;
+            }
+         pthread_mutex_unlock(&symbol_table_mutex);
+      }
 
       for (i = 0; bytes_this_pass > 0 ; i++) {
 
@@ -162,12 +178,22 @@ void* compress_thread(void* t_ops) {
          pthread_mutex_lock(&status_mutex);
             status+=bytes_to_compress;
          pthread_mutex_unlock(&status_mutex);
-
          bytes_this_pass -= bytes_to_compress;
       }
    }
 
    deflateEnd(&strm);
+
+   /* When called from directory processing mode, close the file descriptor and 
+      add back to the threadpool */
+   if (close_fd) {
+      close(fd);
+      if (t_ops)
+         free(t_ops);
+      pthread_mutex_lock(&threadpool_mutex);
+         threadpool--;
+      pthread_mutex_unlock(&threadpool_mutex);
+   }
 
    if (ibuff)
       free(ibuff);
@@ -176,48 +202,60 @@ void* compress_thread(void* t_ops) {
    if (obuff)
       free(obuff);
 
-   /* When called from directory processing mode, close the file descriptor and 
-      add back to the threadpool */
-   if (close_fd) {
-      close(fd);
-      pthread_mutex_lock(&threadpool_mutex);
-         threadpool--;
-      pthread_mutex_unlock(&threadpool_mutex);
-   }
-
    return NULL;
 }
 
 void print_results(uint64_t size_in_bytes) {
 
-   uint32_t i, j;
+   uint32_t i, j, k;
    uint64_t bucket_sum = 0;
+   uint64_t quantized_bucket_sum = 0;
    uint64_t bucket_sum_uncompressed = 0;
    uint64_t bucket_tally = 0;
    uint64_t max_bucket_tally = 0;
+   uint64_t total_symbols = 0;
    float    hash_count = 0;
    float    hash_percent = 0;
    float    compression_ratio = 0;
+   float    quantized_compression_ratio = 0;
+   float    entropy = 0;
+   float    p_sym = 0;
 
    /* Get total (un)compressed bytes */ 
+   k = 512;   // Minimum size in 512-byte quantized compression
    for (i = 1; i <= 4096; i++ ) {
-
-      /* Byte sums */
-      bucket_sum += buckets[i] * i;
       bucket_sum_uncompressed += buckets[i] * 4096;
+      bucket_sum += buckets[i] * i;
+      quantized_bucket_sum += buckets[i] * k; 
+      if ( (i % 512) == 0 )
+         k += 512;
    }
 
    if (bucket_sum == 0)   // Could be zero if program is terminated quickly 
       compression_ratio = 0.0;
-   else
+   else {
       compression_ratio = ((bucket_sum_uncompressed*1.0)/(bucket_sum*1.0)); 
+      quantized_compression_ratio = ((bucket_sum_uncompressed*1.0)/(quantized_bucket_sum*1.0)); 
+   }
+
+   if (measure_entropy) {
+      for ( i = 0; i<256; i++ )
+         total_symbols += symbol_table[i];
+      for ( i = 0; i<256; i++ ) {
+         p_sym = (float)symbol_table[i] / (float)total_symbols;
+         if (p_sym > 0)
+            entropy += -1.0 * p_sym * log2(p_sym);
+      }
+   }
 
    printf("\n\n");
    printf("Total Bytes Analyzed     : %lu\n", bucket_sum_uncompressed);
    if (dirmode_files)
-   printf("Total Files Analyzed     : %lu\n", dirmode_files);
+      printf("Total Files Analyzed     : %lu\n", dirmode_files);
    printf("All Zero (Empty) Sectors : %lu\n", buckets[0]);
    printf("Incompressible Sectors   : %lu\n", buckets[4096]);
+   if (measure_entropy)
+      printf("Shannon Entropy (8-bit)  : %.2f\n", entropy);
 
    /* Get the histogram entry with the biggest value */
    for (i = 1; i <= 4096; i++ ) {
@@ -247,8 +285,10 @@ void print_results(uint64_t size_in_bytes) {
             printf(" %lu\n", bucket_tally);
             bucket_tally = 0;
          }
-      }  
+      }
       printf("\nEstimated Compression Ratio with ScaleFlux: %.1f:1\n", compression_ratio);
+      if (quantized_compression)
+         printf("Estimated Compression Ratio with 512-byte Quantization: %.1f:1\n", quantized_compression_ratio);
    } else 
       printf("\nCompression ratio with ScaleFlux cannot be estimated because the drive is empty\n");
 
@@ -274,11 +314,15 @@ int compress_dir_callback(const char* path, const struct stat* st, int32_t flag,
          return EXIT_SUCCESS;
    }
 
-   thread_id = malloc(thread_cnt*sizeof(pthread_t));
-   ops       = malloc(thread_cnt*sizeof(compress_thread_t));
+   thread_id = malloc(sizeof(pthread_t));
+   ops       = malloc(sizeof(compress_thread_t));
 
    if (!thread_id || !ops) {
       fprintf(stderr, "Could not allocate memory for threads\n");
+      if (thread_id)
+         free(thread_id);
+      if (ops)
+         free(ops);
       return EXIT_FAILURE;
    }
 
@@ -286,7 +330,12 @@ int compress_dir_callback(const char* path, const struct stat* st, int32_t flag,
 
    if (fd == -1) {
       fprintf(stderr, "Unable to open %s for reading (%s)\n", path, strerror(errno));
-      return 0;
+      if (thread_id)
+         free(thread_id);
+      if (ops)
+         free(ops);
+      close(fd);
+      return EXIT_FAILURE;
    }
 
    ops->fd       = fd;
@@ -300,14 +349,17 @@ int compress_dir_callback(const char* path, const struct stat* st, int32_t flag,
 
    /* Take a credit from the threadpool and launch a thread */
    pthread_mutex_lock(&threadpool_mutex);
-      threadpool++;
       pthread_create(thread_id, NULL, &compress_thread, ops);
+      threadpool++;
       pthread_detach(*thread_id);
    pthread_mutex_unlock(&threadpool_mutex);
 
    /* Increment counters */
    dirmode_bytes += ops->bytes;
    dirmode_files += 1;
+
+   if (thread_id)
+      free(thread_id);
 
    return 0;
 }
@@ -402,6 +454,11 @@ int compress_blk_or_file(char* path, struct stat st, int32_t isblk) {
 
    if (!thread_id || !ops) {
       fprintf(stderr, "Could not allocate memory for threads\n");
+      if (thread_id)
+         free(thread_id);  
+      if (ops)
+         free(ops); 
+      close(fd);
       return EXIT_FAILURE;
    }
 
@@ -412,7 +469,7 @@ int compress_blk_or_file(char* path, struct stat st, int32_t isblk) {
       ops[i].bytes    = bytes_per_thread;
       ops[i].offset   = bytes_per_thread * i;
 
-      /* Add any rounding error to the LAST thread */
+      /* Add any rounding error to the last thread */
       if (i == thread_cnt-1)
          ops[i].bytes += roundoff;
 
@@ -451,16 +508,25 @@ int main(int argc, char* argv[]) {
    if (argc <= 2) {
       fprintf(stderr, "Reads an entire disk, single file, or directory (recursively)");
       fprintf(stderr, " and estimates compressibility on ScaleFlux devices.\n\n");
-      fprintf(stderr, "\tUsage: %s -d <File, Directory, or Block Device> -t <Threads>\n\n", argv[0]);
+      fprintf(stderr, "\tUsage: %s -d <File, Directory, or Block Device> -t <Threads>\n", argv[0]);
+      fprintf(stderr, "Advanced flags:\n");
+      fprintf(stderr, "   -q : Estimate using 512-byte quantized compression\n");
+      fprintf(stderr, "   -e : Measure data entropy\n\n");
       exit(EXIT_FAILURE);
    } else {
-      while ((args = getopt(argc, argv, "d:t:")) != -1) {
+      while ((args = getopt(argc, argv, "d:t:qe")) != -1) {
          switch (args) {
             case 'd':   // File, directory or disk to test
                path = optarg;
                break;
             case 't':   // Number of compression threads
                thread_cnt = atoi(optarg);
+               break;
+            case 'q':
+               quantized_compression = 1;
+               break;
+            case 'e':
+               measure_entropy = 1;
                break;
             case '?':
                fprintf(stderr, "Unknown option %c\n", optopt);
@@ -472,9 +538,14 @@ int main(int argc, char* argv[]) {
    }
 
    if ( path == NULL ) {
-      fprintf(stderr, "Usage: %s -d <File, Directory, or Block Device> -t <Threads>\n\n", argv[0]);
+      fprintf(stderr, "Path specified is null\n");
       exit(EXIT_FAILURE);
    }
+
+   pthread_mutex_init(&bucket_mutex, NULL);
+   pthread_mutex_init(&status_mutex, NULL);
+   pthread_mutex_init(&threadpool_mutex, NULL);
+   pthread_mutex_init(&symbol_table_mutex, NULL);
 
    signal(SIGINT, signal_handler);   // Intercept ctrl-c
 
@@ -503,6 +574,11 @@ int main(int argc, char* argv[]) {
       fprintf(stderr, "Could not open path %s (ERRNO: %s)\n", path, strerror(errno));
       exit(EXIT_FAILURE);
    }
+
+   pthread_mutex_destroy(&bucket_mutex);
+   pthread_mutex_destroy(&status_mutex);
+   pthread_mutex_destroy(&threadpool_mutex);
+   pthread_mutex_destroy(&symbol_table_mutex);
 
    exit(EXIT_SUCCESS);
 }
