@@ -1,6 +1,8 @@
 ## Building
+Precompiled binaries are in the bin folder (currently x86_64 only).
+To build it yourself, you can use:
 ```
-gcc c_est.c -pthread -D_GNU_SOURCE -lz -o c_est
+gcc c_est.c -pthread -D_GNU_SOURCE -lz -lm -o c_est
 ```
  
 ## Usage
