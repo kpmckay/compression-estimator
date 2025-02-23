@@ -286,9 +286,10 @@ void print_results(uint64_t size_in_bytes) {
             bucket_tally = 0;
          }
       }
-      printf("\nEstimated Compression Ratio with ScaleFlux: %.1f:1\n", compression_ratio);
       if (quantized_compression)
          printf("Estimated Compression Ratio with 512-byte Quantization: %.1f:1\n", quantized_compression_ratio);
+      else
+         printf("\nEstimated Compression Ratio with ScaleFlux: %.1f:1\n", compression_ratio);
    } else 
       printf("\nCompression ratio with ScaleFlux cannot be estimated because the drive is empty\n");
 
