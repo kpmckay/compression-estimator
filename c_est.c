@@ -55,6 +55,203 @@ static void signal_handler(int _) {
    run = 0;
 }
 
+typedef struct {
+   uint64_t unknown;
+   uint64_t lz4;
+   uint64_t gzip;
+   uint64_t bz2;
+   uint64_t zstd;
+   uint64_t xz;
+   uint64_t zip;
+   uint64_t rar;
+   uint64_t z7z;
+   uint64_t wav;
+   uint64_t mp3;
+   uint64_t flac;
+   uint64_t aac;
+   uint64_t mp4;
+   uint64_t avi;
+   uint64_t mkv;
+   uint64_t flv;
+   uint64_t mpeg;
+   uint64_t jpeg;
+   uint64_t png;
+   uint64_t gif;
+   uint64_t webp;
+   uint64_t jpeg2000;
+   uint64_t tiff;
+   uint64_t heif;
+   uint64_t wma;
+   uint64_t ogg;
+   uint64_t mov;
+   uint64_t avif;
+   uint64_t bpg;
+
+} compression_format_t;
+
+compression_format_t signatures;
+compression_format_t bytes;
+
+int detect_compression(int fd, int64_t size) {
+
+   unsigned char signature[16] = {0};
+   ssize_t bytes_read;
+
+   off_t original_offset = lseek(fd, 0, SEEK_CUR);
+   if (original_offset == -1) {
+       return EXIT_FAILURE;
+   }
+
+   if (lseek(fd, 0, SEEK_SET) == -1) {
+       return EXIT_FAILURE; 
+   }
+
+   bytes_read = read(fd, signature, sizeof(signature));
+   if (bytes_read < 0) {
+       lseek(fd, original_offset, SEEK_SET);
+       return EXIT_FAILURE;
+   }
+
+   lseek(fd, original_offset, SEEK_SET);
+
+   if (bytes_read >= 6 && memcmp(signature, "\xFD\x37\x7A\x58\x5A\x00", 6) == 0) {
+      signatures.xz++;
+      bytes.xz+=size;
+   }
+   else if (bytes_read >= 4 && memcmp(signature, "\x04\x22\x4D\x18", 4) == 0) {
+      signatures.lz4++;
+      bytes.lz4+=size;
+   }
+   else if (bytes_read >= 4 && memcmp(signature, "\x28\xB5\x2F\xFD", 4) == 0) {
+      signatures.zstd++;
+      bytes.zstd+=size;
+   }
+   else if (bytes_read >= 3 && memcmp(signature, "\x42\x5A\x68", 3) == 0) {
+      signatures.bz2++;
+      bytes.bz2+=size;
+   }
+   else if (bytes_read >= 2 && memcmp(signature, "\x1F\x8B", 2) == 0) {
+      signatures.gzip++;
+      bytes.gzip+=size;
+   }
+   else if (bytes_read >= 7 && (memcmp(signature, "\x52\x61\x72\x21\x1A\x07\x00", 7) == 0 ||
+                                memcmp(signature, "\x52\x61\x72\x21\x1A\x07\x01", 7) == 0)) {
+      signatures.rar++;
+      bytes.rar+=size;
+   }
+   else if (bytes_read >= 6 && (memcmp(signature, "\x37\x7A\xBC\xAF\x27\x1C", 6) == 0)) {
+      signatures.z7z++;
+      bytes.z7z+=size;
+   }
+   else if (bytes_read >= 4 && (memcmp(signature, "\x50\x4B\x03\x04", 4) == 0)) {
+      signatures.zip++;
+      bytes.zip+=size;
+   }
+   else if (bytes_read >= 4 && (memcmp(signature, "\x66\x4C\x61\x43", 4) == 0)) {
+      signatures.flac++;
+      bytes.flac+=size;
+   }
+   else if (bytes_read >= 4 && (memcmp(signature, "\x46\x4C\x56\x01", 4) == 0)) {
+      signatures.flv++;
+      bytes.flv+=size;
+   }
+   else if (bytes_read >= 4 && (memcmp(signature, "\x1A\x45\xDF\xA3", 4) == 0)) {
+      signatures.mkv++;
+      bytes.mkv+=size;
+   }
+   else if (bytes_read >= 12 && (memcmp(signature, "\x52\x49\x46\x46", 4) == 0) &&
+                                (memcmp(signature + 8, "\x57\x41\x56\x45", 4) == 0)) {
+      signatures.wav++;
+      bytes.wav+=size;
+   }
+   else if (bytes_read >= 12 && (memcmp(signature, "\x52\x49\x46\x46", 4) == 0) &&
+                                (memcmp(signature + 8, "\x41\x56\x49\x20", 4) == 0)) {
+      signatures.avi++;
+      bytes.avi+=size;
+   }
+   else if (bytes_read >= 2 && (memcmp(signature, "\xFF\xF1", 2) == 0 ||
+                                memcmp(signature, "\xFF\xF9", 2) == 0)) {
+      signatures.aac++;
+      bytes.aac+=size;
+   }
+   else if (bytes_read >= 2 && (signature[0] == 0xFF && (signature[1] & 0xF0) == 0xF0)) {
+      signatures.mp3++;
+      bytes.mp3+=size;
+   }
+   else if (bytes_read >= 8 && (memcmp(signature, "\x89\x50\x4E\x47\x0D\x0A\x1A\x0A", 8) == 0)) {
+      signatures.png++;
+      bytes.png+=size;
+   }
+   else if (bytes_read >= 8 && (memcmp(signature, "\x00\x00\x00\x0C\x6A\x50\x20\x20", 8) == 0)) {
+      signatures.jpeg2000++;
+      bytes.jpeg2000+=size;
+   }
+   else if (bytes_read >= 12 && (memcmp(signature, "\x52\x49\x46\x46", 4) == 0) &&
+                                (memcmp(signature + 8, "\x57\x45\x42\x50", 4) == 0)) {
+      signatures.webp++;
+      bytes.webp+=size;
+   }
+   else if (bytes_read >= 6 && (memcmp(signature, "\x47\x49\x46\x38", 4) == 0) &&
+                               (memcmp(signature + 4, "\x37\x61", 2) == 0 || 
+                                memcmp(signature + 4, "\x39\x61", 2) == 0)) {
+      signatures.gif++;
+      bytes.gif+=size;
+   }
+   else if (bytes_read >= 4 && (memcmp(signature, "\x4D\x4D\x00\x2A", 4) == 0 ||
+                                memcmp(signature, "\x49\x49\x2A\x00", 4) == 0)) {
+      signatures.tiff++;
+      bytes.tiff+=size;
+   }
+   else if (bytes_read >= 12 && (memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0) &&
+                                (memcmp(signature + 8, "\x68\x65\x69\x63", 4) == 0 || 
+                                 memcmp(signature + 8, "\x6D\x69\x66\x31", 4) == 0)) {
+      signatures.heif++;
+      bytes.heif+=size;
+   }
+   else if (bytes_read >= 2 && (memcmp(signature, "\xFF\xD8", 2) == 0)) {
+      signatures.jpeg++;
+      bytes.jpeg+=size;
+   }
+   else if (bytes_read >= 4 && (memcmp(signature, "\x30\x26\xB2\x75", 4) == 0)) {
+      signatures.wma++;
+      bytes.wma+=size;
+   }
+   else if (bytes_read >= 4 && (memcmp(signature, "\x4F\x67\x67\x53", 4) == 0)) {
+      signatures.ogg++;
+      bytes.ogg+=size;
+   }
+   else if (bytes_read >= 12 && (memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0) &&
+                                (memcmp(signature + 8, "\x71\x74\x20\x20", 4) == 0)) {
+      signatures.mov++;
+      bytes.mov+=size;
+   }
+   else if (bytes_read >= 12 && (memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0) &&
+                                (memcmp(signature + 8, "\x61\x76\x69\x66", 4) == 0)) {
+      signatures.avif++;
+      bytes.avif+=size;
+   } 
+   else if (bytes_read >= 4 && (memcmp(signature, "\x42\x50\x47\xFB", 4) == 0)) {
+      signatures.bpg++;
+      bytes.bpg+=size;
+   }
+   else if (bytes_read >= 1 && (signature[0] == 0x47)) {
+      signatures.mpeg++;
+      bytes.mpeg+=size;
+   }
+   else if (bytes_read >= 8 && (memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0)) {
+      signatures.mp4++;
+      bytes.mp4+=size;
+   }
+   else {
+      signatures.unknown++;
+      bytes.unknown+=size;
+   }
+
+   return EXIT_SUCCESS;
+}
+
+
+
 void* monitor_thread(void* t_ops) {
 
    monitor_thread_t ops = *((monitor_thread_t*) t_ops);
@@ -250,12 +447,52 @@ void print_results(uint64_t size_in_bytes) {
 
    printf("\n\n");
    printf("Total Bytes Analyzed     : %lu\n", bucket_sum_uncompressed);
-   if (dirmode_files)
+   if (dirmode_files) 
       printf("Total Files Analyzed     : %lu\n", dirmode_files);
    printf("All Zero (Empty) Sectors : %lu\n", buckets[0]);
    printf("Incompressible Sectors   : %lu\n", buckets[4096]);
    if (measure_entropy)
       printf("Shannon Entropy (8-bit)  : %.2f\n", entropy);
+
+   if (dirmode_files) {
+      printf("\n");
+      printf("File Signature Analysis:\n\n");
+      printf("   %lu files without compression detected (%.2f %% of files, %.2f %% of data analyzed)\n", 
+                 signatures.unknown, (((float)signatures.unknown)/dirmode_files)*100, (((float)bytes.unknown)/bucket_sum_uncompressed)*100);
+      printf("   Files with compression detected...\n\n");
+
+      printf("   File Type : # of Files   [ %% of Data ]\n");
+      printf("   --------------------------------------\n");
+      printf("          7z : %-12lu [ %7.2f %% ]\n", signatures.z7z, (((float)bytes.z7z)/bucket_sum_uncompressed)*100);
+      printf("         aac : %-12lu [ %7.2f %% ]\n", signatures.aac, (((float)bytes.aac)/bucket_sum_uncompressed)*100);
+      printf("         avi : %-12lu [ %7.2f %% ]\n", signatures.avi, (((float)bytes.avi)/bucket_sum_uncompressed)*100);
+      printf("        avif : %-12lu [ %7.2f %% ]\n", signatures.avif, (((float)bytes.avif)/bucket_sum_uncompressed)*100);
+      printf("         bpg : %-12lu [ %7.2f %% ]\n", signatures.bpg, (((float)bytes.bpg)/bucket_sum_uncompressed)*100);
+      printf("         bz2 : %-12lu [ %7.2f %% ]\n", signatures.bz2, (((float)bytes.bz2)/bucket_sum_uncompressed)*100);
+      printf("        flac : %-12lu [ %7.2f %% ]\n", signatures.flac, (((float)bytes.flac)/bucket_sum_uncompressed)*100);
+      printf("         flv : %-12lu [ %7.2f %% ]\n", signatures.flv, (((float)bytes.flv)/bucket_sum_uncompressed)*100);
+      printf("         gif : %-12lu [ %7.2f %% ]\n", signatures.gif, (((float)bytes.gif)/bucket_sum_uncompressed)*100);
+      printf("        gzip : %-12lu [ %7.2f %% ]\n", signatures.gzip, (((float)bytes.gzip)/bucket_sum_uncompressed)*100);
+      printf("        heif : %-12lu [ %7.2f %% ]\n", signatures.heif, (((float)bytes.heif)/bucket_sum_uncompressed)*100);
+      printf("        jpeg : %-12lu [ %7.2f %% ]\n", signatures.jpeg, (((float)bytes.jpeg)/bucket_sum_uncompressed)*100);
+      printf("    jpeg2000 : %-12lu [ %7.2f %% ]\n", signatures.jpeg2000, (((float)bytes.jpeg2000)/bucket_sum_uncompressed)*100);
+      printf("         lz4 : %-12lu [ %7.2f %% ]\n", signatures.lz4, (((float)bytes.lz4)/bucket_sum_uncompressed)*100);
+      printf("         mov : %-12lu [ %7.2f %% ]\n", signatures.mov, (((float)bytes.mov)/bucket_sum_uncompressed)*100);
+      printf("         mp3 : %-12lu [ %7.2f %% ]\n", signatures.mp3, (((float)bytes.mp3)/bucket_sum_uncompressed)*100);
+      printf("         mp4 : %-12lu [ %7.2f %% ]\n", signatures.mp4, (((float)bytes.mp4)/bucket_sum_uncompressed)*100);
+      printf("        mpeg : %-12lu [ %7.2f %% ]\n", signatures.mpeg, (((float)bytes.mpeg)/bucket_sum_uncompressed)*100);
+      printf("         mkv : %-12lu [ %7.2f %% ]\n", signatures.mkv, (((float)bytes.mkv)/bucket_sum_uncompressed)*100);
+      printf("         ogg : %-12lu [ %7.2f %% ]\n", signatures.ogg, (((float)bytes.ogg)/bucket_sum_uncompressed)*100);
+      printf("         png : %-12lu [ %7.2f %% ]\n", signatures.png, (((float)bytes.png)/bucket_sum_uncompressed)*100);
+      printf("         rar : %-12lu [ %7.2f %% ]\n", signatures.rar, (((float)bytes.rar)/bucket_sum_uncompressed)*100);
+      printf("        tiff : %-12lu [ %7.2f %% ]\n", signatures.tiff, (((float)bytes.tiff)/bucket_sum_uncompressed)*100);
+      printf("         wav : %-12lu [ %7.2f %% ]\n", signatures.wav, (((float)bytes.wav)/bucket_sum_uncompressed)*100);
+      printf("        webp : %-12lu [ %7.2f %% ]\n", signatures.webp, (((float)bytes.webp)/bucket_sum_uncompressed)*100);
+      printf("         wma : %-12lu [ %7.2f %% ]\n", signatures.wma, (((float)bytes.wma)/bucket_sum_uncompressed)*100);
+      printf("          xz : %-12lu [ %7.2f %% ]\n", signatures.xz, (((float)bytes.xz)/bucket_sum_uncompressed)*100);
+      printf("         zip : %-12lu [ %7.2f %% ]\n", signatures.zip, (((float)bytes.zip)/bucket_sum_uncompressed)*100);
+      printf("        zstd : %-12lu [ %7.2f %% ]\n", signatures.zstd, (((float)bytes.zstd)/bucket_sum_uncompressed)*100);
+   }
 
    /* Get the histogram entry with the biggest value */
    for (i = 1; i <= 4096; i++ ) {
@@ -338,6 +575,17 @@ int compress_dir_callback(const char* path, const struct stat* st, int32_t flag,
       close(fd);
       return EXIT_FAILURE;
    }
+
+   if (detect_compression(fd, st->st_size)) {
+      fprintf(stderr, "Unable to reliably reset seek position in file %s (%s)\n", path, strerror(errno));
+      if (thread_id)
+         free(thread_id);
+      if (ops)
+         free(ops);
+      close(fd);
+      return EXIT_FAILURE;
+   }
+      
 
    ops->fd       = fd;
    ops->close_fd = 1;   // Request compression thread to close the file descriptor
@@ -434,6 +682,11 @@ int compress_blk_or_file(char* path, struct stat st, int32_t isblk) {
          close(fd);
          return EXIT_FAILURE;
       }
+   }
+
+   if (detect_compression(fd, st.st_size)) {
+      fprintf(stderr, "Unable to reliably reset seek position in file %s (%s)\n", path, strerror(errno));
+      return EXIT_FAILURE;
    }
 
    /* Just use a singe thread for small files or block devices */
