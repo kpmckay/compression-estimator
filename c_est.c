@@ -30,6 +30,7 @@ uint64_t dirmode_bytes = 0;
 uint64_t dirmode_files = 0;
 uint8_t  quantized_compression = 0;
 uint8_t  measure_entropy = 0;
+uint8_t  detect_file_headers = 0;
 uint64_t symbol_table[256] = {0};
 
 pthread_mutex_t bucket_mutex;
@@ -454,7 +455,7 @@ void print_results(uint64_t size_in_bytes) {
    if (measure_entropy)
       printf("Shannon Entropy (8-bit)  : %.2f\n", entropy);
 
-   if (dirmode_files) {
+   if (dirmode_files && detect_file_headers) {
       printf("\n");
       printf("File Signature Analysis:\n\n");
       printf("   %lu files without compression detected (%.2f %% of files, %.2f %% of data analyzed)\n", 
@@ -576,16 +577,17 @@ int compress_dir_callback(const char* path, const struct stat* st, int32_t flag,
       return EXIT_FAILURE;
    }
 
-   if (detect_compression(fd, st->st_size)) {
-      fprintf(stderr, "Unable to reliably reset seek position in file %s (%s)\n", path, strerror(errno));
-      if (thread_id)
-         free(thread_id);
-      if (ops)
-         free(ops);
-      close(fd);
-      return EXIT_FAILURE;
+   if (detect_file_headers) {
+      if (detect_compression(fd, st->st_size)) {
+         fprintf(stderr, "Unable to reliably reset seek position in file %s (%s)\n", path, strerror(errno));
+         if (thread_id)
+            free(thread_id);
+         if (ops)
+            free(ops);
+         close(fd);
+         return EXIT_FAILURE;
+      }
    }
-      
 
    ops->fd       = fd;
    ops->close_fd = 1;   // Request compression thread to close the file descriptor
@@ -684,10 +686,12 @@ int compress_blk_or_file(char* path, struct stat st, int32_t isblk) {
       }
    }
 
-   if (detect_compression(fd, st.st_size)) {
-      fprintf(stderr, "Unable to reliably reset seek position in file %s (%s)\n", path, strerror(errno));
-      return EXIT_FAILURE;
-   }
+   if (!isblk && detect_file_headers) {
+      if (detect_compression(fd, st.st_size)) {
+         fprintf(stderr, "Unable to reliably reset seek position in file %s (%s)\n", path, strerror(errno));
+         return EXIT_FAILURE;
+     }
+  }
 
    /* Just use a singe thread for small files or block devices */
    if (size_in_bytes / thread_cnt < 4096) {
@@ -763,12 +767,13 @@ int main(int argc, char* argv[]) {
       fprintf(stderr, "Reads an entire disk, single file, or directory (recursively)");
       fprintf(stderr, " and estimates compressibility on ScaleFlux devices.\n\n");
       fprintf(stderr, "\tUsage: %s -d <File, Directory, or Block Device> -t <Threads>\n", argv[0]);
-      fprintf(stderr, "Advanced flags:\n");
+      fprintf(stderr, "Advanced flags:\n\n");
       fprintf(stderr, "   -q : Estimate using 512-byte quantized compression\n");
-      fprintf(stderr, "   -e : Measure data entropy\n\n");
+      fprintf(stderr, "   -e : Measure data entropy\n");
+      fprintf(stderr, "   -c : Show statistics for pre-compressed file formats (file or direcory mode only)\n\n");
       exit(EXIT_FAILURE);
    } else {
-      while ((args = getopt(argc, argv, "d:t:qe")) != -1) {
+      while ((args = getopt(argc, argv, "d:t:qec")) != -1) {
          switch (args) {
             case 'd':   // File, directory or disk to test
                path = optarg;
@@ -781,6 +786,9 @@ int main(int argc, char* argv[]) {
                break;
             case 'e':
                measure_entropy = 1;
+               break;
+            case 'c':
+               detect_file_headers = 1;
                break;
             case '?':
                fprintf(stderr, "Unknown option %c\n", optopt);
