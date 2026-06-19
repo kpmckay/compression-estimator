@@ -6,7 +6,6 @@
 #include <string.h>
 #include <signal.h>
 #include <stdint.h>
-#include <malloc.h>
 #include <pthread.h>
 #include <ftw.h>
 #include <math.h>
@@ -20,9 +19,8 @@
 #define HISTOGRAM_RESOLUTION     128
 #define GZIP_COMPRESSION_LEVEL   1
 
-extern int errno;
-
 uint64_t buckets[4096+1] = {0};
+uint64_t padding_buckets[4096+1] = {0};
 uint64_t status = 0;
 int32_t  threadpool;
 uint32_t thread_cnt = 1;
@@ -30,10 +28,12 @@ uint64_t dirmode_bytes = 0;
 uint64_t dirmode_files = 0;
 uint8_t  quantized_compression = 0;
 uint8_t  measure_entropy = 0;
+uint8_t  measure_padding = 0;
 uint8_t  detect_file_headers = 0;
 uint64_t symbol_table[256] = {0};
 
 pthread_mutex_t bucket_mutex;
+pthread_mutex_t padding_mutex;
 pthread_mutex_t status_mutex;
 pthread_mutex_t threadpool_mutex;
 pthread_mutex_t symbol_table_mutex;
@@ -56,202 +56,141 @@ static void signal_handler(int _) {
    run = 0;
 }
 
+enum {
+   FMT_UNKNOWN = 0,
+   FMT_7Z, FMT_AAC, FMT_AVI, FMT_AVIF, FMT_BPG, FMT_BZ2,
+   FMT_FLAC, FMT_FLV, FMT_GIF, FMT_GZIP, FMT_HEIF, FMT_JPEG,
+   FMT_JPEG2000, FMT_LZ4, FMT_MKV, FMT_MOV, FMT_MP3, FMT_MP4,
+   FMT_MPEG, FMT_OGG, FMT_PNG, FMT_RAR, FMT_TIFF, FMT_WAV,
+   FMT_WEBP, FMT_WMA, FMT_XZ, FMT_ZIP, FMT_ZSTD,
+   FMT_COUNT
+};
+
 typedef struct {
-   uint64_t unknown;
-   uint64_t lz4;
-   uint64_t gzip;
-   uint64_t bz2;
-   uint64_t zstd;
-   uint64_t xz;
-   uint64_t zip;
-   uint64_t rar;
-   uint64_t z7z;
-   uint64_t wav;
-   uint64_t mp3;
-   uint64_t flac;
-   uint64_t aac;
-   uint64_t mp4;
-   uint64_t avi;
-   uint64_t mkv;
-   uint64_t flv;
-   uint64_t mpeg;
-   uint64_t jpeg;
-   uint64_t png;
-   uint64_t gif;
-   uint64_t webp;
-   uint64_t jpeg2000;
-   uint64_t tiff;
-   uint64_t heif;
-   uint64_t wma;
-   uint64_t ogg;
-   uint64_t mov;
-   uint64_t avif;
-   uint64_t bpg;
+   const char* name;
+   uint64_t sig_count;
+   uint64_t byte_count;
+} format_t;
 
-} compression_format_t;
-
-compression_format_t signatures;
-compression_format_t bytes;
+format_t formats[FMT_COUNT] = {
+   [FMT_UNKNOWN]  = {"unknown"},
+   [FMT_7Z]       = {"7z"},
+   [FMT_AAC]      = {"aac"},
+   [FMT_AVI]      = {"avi"},
+   [FMT_AVIF]     = {"avif"},
+   [FMT_BPG]      = {"bpg"},
+   [FMT_BZ2]      = {"bz2"},
+   [FMT_FLAC]     = {"flac"},
+   [FMT_FLV]      = {"flv"},
+   [FMT_GIF]      = {"gif"},
+   [FMT_GZIP]     = {"gzip"},
+   [FMT_HEIF]     = {"heif"},
+   [FMT_JPEG]     = {"jpeg"},
+   [FMT_JPEG2000] = {"jpeg2000"},
+   [FMT_LZ4]      = {"lz4"},
+   [FMT_MKV]      = {"mkv"},
+   [FMT_MOV]      = {"mov"},
+   [FMT_MP3]      = {"mp3"},
+   [FMT_MP4]      = {"mp4"},
+   [FMT_MPEG]     = {"mpeg"},
+   [FMT_OGG]      = {"ogg"},
+   [FMT_PNG]      = {"png"},
+   [FMT_RAR]      = {"rar"},
+   [FMT_TIFF]     = {"tiff"},
+   [FMT_WAV]      = {"wav"},
+   [FMT_WEBP]     = {"webp"},
+   [FMT_WMA]      = {"wma"},
+   [FMT_XZ]       = {"xz"},
+   [FMT_ZIP]      = {"zip"},
+   [FMT_ZSTD]     = {"zstd"},
+};
 
 int detect_compression(int fd, int64_t size) {
 
    unsigned char signature[16] = {0};
    ssize_t bytes_read;
+   int fmt = FMT_UNKNOWN;
 
-   off_t original_offset = lseek(fd, 0, SEEK_CUR);
-   if (original_offset == -1) {
-       return EXIT_FAILURE;
-   }
+   bytes_read = pread(fd, signature, sizeof(signature), 0);
+   if (bytes_read < 0)
+      return EXIT_FAILURE;
 
-   if (lseek(fd, 0, SEEK_SET) == -1) {
-       return EXIT_FAILURE; 
-   }
-
-   bytes_read = read(fd, signature, sizeof(signature));
-   if (bytes_read < 0) {
-       lseek(fd, original_offset, SEEK_SET);
-       return EXIT_FAILURE;
-   }
-
-   lseek(fd, original_offset, SEEK_SET);
-
-   if (bytes_read >= 6 && memcmp(signature, "\xFD\x37\x7A\x58\x5A\x00", 6) == 0) {
-      signatures.xz++;
-      bytes.xz+=size;
-   }
-   else if (bytes_read >= 4 && memcmp(signature, "\x04\x22\x4D\x18", 4) == 0) {
-      signatures.lz4++;
-      bytes.lz4+=size;
-   }
-   else if (bytes_read >= 4 && memcmp(signature, "\x28\xB5\x2F\xFD", 4) == 0) {
-      signatures.zstd++;
-      bytes.zstd+=size;
-   }
-   else if (bytes_read >= 3 && memcmp(signature, "\x42\x5A\x68", 3) == 0) {
-      signatures.bz2++;
-      bytes.bz2+=size;
-   }
-   else if (bytes_read >= 2 && memcmp(signature, "\x1F\x8B", 2) == 0) {
-      signatures.gzip++;
-      bytes.gzip+=size;
-   }
+   if (bytes_read >= 6 && memcmp(signature, "\xFD\x37\x7A\x58\x5A\x00", 6) == 0)
+      fmt = FMT_XZ;
+   else if (bytes_read >= 4 && memcmp(signature, "\x04\x22\x4D\x18", 4) == 0)
+      fmt = FMT_LZ4;
+   else if (bytes_read >= 4 && memcmp(signature, "\x28\xB5\x2F\xFD", 4) == 0)
+      fmt = FMT_ZSTD;
+   else if (bytes_read >= 3 && memcmp(signature, "\x42\x5A\x68", 3) == 0)
+      fmt = FMT_BZ2;
+   else if (bytes_read >= 2 && memcmp(signature, "\x1F\x8B", 2) == 0)
+      fmt = FMT_GZIP;
    else if (bytes_read >= 7 && (memcmp(signature, "\x52\x61\x72\x21\x1A\x07\x00", 7) == 0 ||
-                                memcmp(signature, "\x52\x61\x72\x21\x1A\x07\x01", 7) == 0)) {
-      signatures.rar++;
-      bytes.rar+=size;
-   }
-   else if (bytes_read >= 6 && (memcmp(signature, "\x37\x7A\xBC\xAF\x27\x1C", 6) == 0)) {
-      signatures.z7z++;
-      bytes.z7z+=size;
-   }
-   else if (bytes_read >= 4 && (memcmp(signature, "\x50\x4B\x03\x04", 4) == 0)) {
-      signatures.zip++;
-      bytes.zip+=size;
-   }
-   else if (bytes_read >= 4 && (memcmp(signature, "\x66\x4C\x61\x43", 4) == 0)) {
-      signatures.flac++;
-      bytes.flac+=size;
-   }
-   else if (bytes_read >= 4 && (memcmp(signature, "\x46\x4C\x56\x01", 4) == 0)) {
-      signatures.flv++;
-      bytes.flv+=size;
-   }
-   else if (bytes_read >= 4 && (memcmp(signature, "\x1A\x45\xDF\xA3", 4) == 0)) {
-      signatures.mkv++;
-      bytes.mkv+=size;
-   }
-   else if (bytes_read >= 12 && (memcmp(signature, "\x52\x49\x46\x46", 4) == 0) &&
-                                (memcmp(signature + 8, "\x57\x41\x56\x45", 4) == 0)) {
-      signatures.wav++;
-      bytes.wav+=size;
-   }
-   else if (bytes_read >= 12 && (memcmp(signature, "\x52\x49\x46\x46", 4) == 0) &&
-                                (memcmp(signature + 8, "\x41\x56\x49\x20", 4) == 0)) {
-      signatures.avi++;
-      bytes.avi+=size;
-   }
+                                memcmp(signature, "\x52\x61\x72\x21\x1A\x07\x01", 7) == 0))
+      fmt = FMT_RAR;
+   else if (bytes_read >= 6 && memcmp(signature, "\x37\x7A\xBC\xAF\x27\x1C", 6) == 0)
+      fmt = FMT_7Z;
+   else if (bytes_read >= 4 && memcmp(signature, "\x50\x4B\x03\x04", 4) == 0)
+      fmt = FMT_ZIP;
+   else if (bytes_read >= 4 && memcmp(signature, "\x66\x4C\x61\x43", 4) == 0)
+      fmt = FMT_FLAC;
+   else if (bytes_read >= 4 && memcmp(signature, "\x46\x4C\x56\x01", 4) == 0)
+      fmt = FMT_FLV;
+   else if (bytes_read >= 4 && memcmp(signature, "\x1A\x45\xDF\xA3", 4) == 0)
+      fmt = FMT_MKV;
+   else if (bytes_read >= 12 && memcmp(signature, "\x52\x49\x46\x46", 4) == 0 &&
+                                memcmp(signature + 8, "\x57\x41\x56\x45", 4) == 0)
+      fmt = FMT_WAV;
+   else if (bytes_read >= 12 && memcmp(signature, "\x52\x49\x46\x46", 4) == 0 &&
+                                memcmp(signature + 8, "\x41\x56\x49\x20", 4) == 0)
+      fmt = FMT_AVI;
    else if (bytes_read >= 2 && (memcmp(signature, "\xFF\xF1", 2) == 0 ||
-                                memcmp(signature, "\xFF\xF9", 2) == 0)) {
-      signatures.aac++;
-      bytes.aac+=size;
-   }
-   else if (bytes_read >= 2 && (signature[0] == 0xFF && (signature[1] & 0xF0) == 0xF0)) {
-      signatures.mp3++;
-      bytes.mp3+=size;
-   }
-   else if (bytes_read >= 8 && (memcmp(signature, "\x89\x50\x4E\x47\x0D\x0A\x1A\x0A", 8) == 0)) {
-      signatures.png++;
-      bytes.png+=size;
-   }
-   else if (bytes_read >= 8 && (memcmp(signature, "\x00\x00\x00\x0C\x6A\x50\x20\x20", 8) == 0)) {
-      signatures.jpeg2000++;
-      bytes.jpeg2000+=size;
-   }
-   else if (bytes_read >= 12 && (memcmp(signature, "\x52\x49\x46\x46", 4) == 0) &&
-                                (memcmp(signature + 8, "\x57\x45\x42\x50", 4) == 0)) {
-      signatures.webp++;
-      bytes.webp+=size;
-   }
-   else if (bytes_read >= 6 && (memcmp(signature, "\x47\x49\x46\x38", 4) == 0) &&
-                               (memcmp(signature + 4, "\x37\x61", 2) == 0 || 
-                                memcmp(signature + 4, "\x39\x61", 2) == 0)) {
-      signatures.gif++;
-      bytes.gif+=size;
-   }
+                                memcmp(signature, "\xFF\xF9", 2) == 0))
+      fmt = FMT_AAC;
+   else if (bytes_read >= 2 && signature[0] == 0xFF && (signature[1] & 0xF0) == 0xF0)
+      fmt = FMT_MP3;
+   else if (bytes_read >= 8 && memcmp(signature, "\x89\x50\x4E\x47\x0D\x0A\x1A\x0A", 8) == 0)
+      fmt = FMT_PNG;
+   else if (bytes_read >= 8 && memcmp(signature, "\x00\x00\x00\x0C\x6A\x50\x20\x20", 8) == 0)
+      fmt = FMT_JPEG2000;
+   else if (bytes_read >= 12 && memcmp(signature, "\x52\x49\x46\x46", 4) == 0 &&
+                                memcmp(signature + 8, "\x57\x45\x42\x50", 4) == 0)
+      fmt = FMT_WEBP;
+   else if (bytes_read >= 6 && memcmp(signature, "\x47\x49\x46\x38", 4) == 0 &&
+                               (memcmp(signature + 4, "\x37\x61", 2) == 0 ||
+                                memcmp(signature + 4, "\x39\x61", 2) == 0))
+      fmt = FMT_GIF;
    else if (bytes_read >= 4 && (memcmp(signature, "\x4D\x4D\x00\x2A", 4) == 0 ||
-                                memcmp(signature, "\x49\x49\x2A\x00", 4) == 0)) {
-      signatures.tiff++;
-      bytes.tiff+=size;
-   }
-   else if (bytes_read >= 12 && (memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0) &&
-                                (memcmp(signature + 8, "\x68\x65\x69\x63", 4) == 0 || 
-                                 memcmp(signature + 8, "\x6D\x69\x66\x31", 4) == 0)) {
-      signatures.heif++;
-      bytes.heif+=size;
-   }
-   else if (bytes_read >= 2 && (memcmp(signature, "\xFF\xD8", 2) == 0)) {
-      signatures.jpeg++;
-      bytes.jpeg+=size;
-   }
-   else if (bytes_read >= 4 && (memcmp(signature, "\x30\x26\xB2\x75", 4) == 0)) {
-      signatures.wma++;
-      bytes.wma+=size;
-   }
-   else if (bytes_read >= 4 && (memcmp(signature, "\x4F\x67\x67\x53", 4) == 0)) {
-      signatures.ogg++;
-      bytes.ogg+=size;
-   }
-   else if (bytes_read >= 12 && (memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0) &&
-                                (memcmp(signature + 8, "\x71\x74\x20\x20", 4) == 0)) {
-      signatures.mov++;
-      bytes.mov+=size;
-   }
-   else if (bytes_read >= 12 && (memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0) &&
-                                (memcmp(signature + 8, "\x61\x76\x69\x66", 4) == 0)) {
-      signatures.avif++;
-      bytes.avif+=size;
-   } 
-   else if (bytes_read >= 4 && (memcmp(signature, "\x42\x50\x47\xFB", 4) == 0)) {
-      signatures.bpg++;
-      bytes.bpg+=size;
-   }
-   else if (bytes_read >= 1 && (signature[0] == 0x47)) {
-      signatures.mpeg++;
-      bytes.mpeg+=size;
-   }
-   else if (bytes_read >= 8 && (memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0)) {
-      signatures.mp4++;
-      bytes.mp4+=size;
-   }
-   else {
-      signatures.unknown++;
-      bytes.unknown+=size;
-   }
+                                memcmp(signature, "\x49\x49\x2A\x00", 4) == 0))
+      fmt = FMT_TIFF;
+   else if (bytes_read >= 12 && memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0 &&
+                                (memcmp(signature + 8, "\x68\x65\x69\x63", 4) == 0 ||
+                                 memcmp(signature + 8, "\x6D\x69\x66\x31", 4) == 0))
+      fmt = FMT_HEIF;
+   else if (bytes_read >= 2 && memcmp(signature, "\xFF\xD8", 2) == 0)
+      fmt = FMT_JPEG;
+   else if (bytes_read >= 4 && memcmp(signature, "\x30\x26\xB2\x75", 4) == 0)
+      fmt = FMT_WMA;
+   else if (bytes_read >= 4 && memcmp(signature, "\x4F\x67\x67\x53", 4) == 0)
+      fmt = FMT_OGG;
+   else if (bytes_read >= 12 && memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0 &&
+                                memcmp(signature + 8, "\x71\x74\x20\x20", 4) == 0)
+      fmt = FMT_MOV;
+   else if (bytes_read >= 12 && memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0 &&
+                                memcmp(signature + 8, "\x61\x76\x69\x66", 4) == 0)
+      fmt = FMT_AVIF;
+   else if (bytes_read >= 4 && memcmp(signature, "\x42\x50\x47\xFB", 4) == 0)
+      fmt = FMT_BPG;
+   else if (bytes_read >= 8 && memcmp(signature + 4, "\x66\x74\x79\x70", 4) == 0)
+      fmt = FMT_MP4;
+   else if (bytes_read >= 1 && signature[0] == 0x47)
+      fmt = FMT_MPEG;
+
+   formats[fmt].sig_count++;
+   formats[fmt].byte_count += size;
 
    return EXIT_SUCCESS;
 }
-
-
 
 void* monitor_thread(void* t_ops) {
 
@@ -277,7 +216,6 @@ void* monitor_thread(void* t_ops) {
    return NULL;
 }
 
-
 void* compress_thread(void* t_ops) {
 
    compress_thread_t ops = *((compress_thread_t*) t_ops);
@@ -289,23 +227,25 @@ void* compress_thread(void* t_ops) {
    ssize_t bytes_in_pread;
    ssize_t bytes_to_compress;
 
-   int32_t fd       = ops.fd;   
-   int32_t close_fd = ops.close_fd;   
+   int32_t fd       = ops.fd;
+   int32_t close_fd = ops.close_fd;
    int64_t offset   = ops.offset;
    int64_t bytes    = ops.bytes;
 
-   uint8_t* ibuff = memalign(4096, (128*1024));            // 128kB buffer, 4k aligned for pread 
-   uint8_t* obuff = malloc((4096+1024)*sizeof(uint8_t));   // 4kB+1kB ouptut buffer (compressed size can be larger) 
-   uint8_t* zbuff = calloc(4096, sizeof(uint8_t));         // 4kB buffer, initialized to zero 
+   uint64_t local_buckets[4097] = {0};
+   uint64_t local_padding[4097] = {0};
+   uint64_t local_symbols[256] = {0};
+   uint64_t local_status = 0;
+
+   uint8_t* ibuff = aligned_alloc(4096, (128*1024));
+   uint8_t* obuff = malloc((4096+1024)*sizeof(uint8_t));
+   uint8_t* zbuff = calloc(4096, sizeof(uint8_t));
 
    if (!ibuff || !zbuff || !obuff) {
       fprintf(stderr, "Error allocating buffers\n");
-      if (ibuff)
-         free(ibuff);
-      if (obuff)
-         free(obuff);
-      if (zbuff)   
-         free(zbuff);
+      free(ibuff);
+      free(obuff);
+      free(zbuff);
       return NULL;
    }
 
@@ -318,46 +258,39 @@ void* compress_thread(void* t_ops) {
 
    while (bytes && run) {
 
-      memset(ibuff,0,(128*1024));
-
-      // Break up preads into 128kB units (if we need to read more than 128kB)
       bytes_to_pread = bytes_this_pass = (bytes >= (128*1024) ? (128*1024) : bytes);
-      bytes_in_pread = 0;
+      ssize_t total_read = 0;
       while (bytes_to_pread) {
-         bytes_in_pread = pread(fd, ibuff+bytes_in_pread, bytes_to_pread, offset+bytes_in_pread);
+         bytes_in_pread = pread(fd, ibuff+total_read, bytes_to_pread, offset+total_read);
          if (bytes_in_pread < 1) {
-             fprintf(stderr, "Unable to read from disk at offset %lu: %s\n", offset+i, strerror(errno));
+             fprintf(stderr, "Unable to read from disk at offset %lu: %s\n", offset+total_read, strerror(errno));
              break;
          }
+         total_read += bytes_in_pread;
          bytes_to_pread -= bytes_in_pread;
       }
+
+      if (total_read < bytes_this_pass)
+         memset(ibuff+total_read, 0, bytes_this_pass - total_read);
 
       offset += bytes_this_pass;
       bytes  -= bytes_this_pass;
 
       if (measure_entropy) {
-         pthread_mutex_lock(&symbol_table_mutex);
-            for ( i = 0; i < bytes_this_pass; i++ ) {
-                symbol_table[ibuff[i]]++;
-            }
-         pthread_mutex_unlock(&symbol_table_mutex);
+         for ( i = 0; i < bytes_this_pass; i++ )
+            local_symbols[ibuff[i]]++;
       }
 
       for (i = 0; bytes_this_pass > 0 ; i++) {
 
-         /* Compress in 4k units to match hardware compression unit */
-         bytes_to_compress = (bytes_this_pass >= 4096 ? 4096 : bytes_this_pass);   
+         bytes_to_compress = (bytes_this_pass >= 4096 ? 4096 : bytes_this_pass);
 
-         /* Check if the data read is all zero, if so, skip compression */
          if (memcmp(zbuff, ibuff+(4096*i), 4096*sizeof(uint8_t)) == 0) {
-            pthread_mutex_lock(&bucket_mutex);
-               buckets[0]++;
-            pthread_mutex_unlock(&bucket_mutex);
+            local_buckets[0]++;
          } else {
-            /* Compress 4k unit */
-            strm.avail_in  = bytes_to_compress; 
+            strm.avail_in  = bytes_to_compress;
             strm.next_in   = ibuff+(4096*i);
-            strm.avail_out = 4096+1024; // Length of obuff
+            strm.avail_out = 4096+1024;
             strm.next_out  = obuff;
 
             if (deflate(&strm, Z_FINISH) != Z_STREAM_END) {
@@ -365,45 +298,65 @@ void* compress_thread(void* t_ops) {
                run = 0;
             }
 
-            pthread_mutex_lock(&bucket_mutex);
-               // Simulate compression bypass
-               strm.total_out > 3840 ? buckets[4096]++ : buckets[strm.total_out]++;
-            pthread_mutex_unlock(&bucket_mutex);
+            strm.total_out > 3840 ? local_buckets[4096]++ : local_buckets[strm.total_out]++;
 
             deflateReset(&strm);
          }
 
-         pthread_mutex_lock(&status_mutex);
-            status+=bytes_to_compress;
-         pthread_mutex_unlock(&status_mutex);
+         if (measure_padding) {
+            int pad = 0;
+            for (int p = bytes_to_compress - 1; p >= 0 && ibuff[(4096*i) + p] == 0; p--)
+               pad++;
+            local_padding[pad]++;
+         }
+
+         local_status += bytes_to_compress;
          bytes_this_pass -= bytes_to_compress;
       }
+
+      pthread_mutex_lock(&status_mutex);
+         status += local_status;
+      pthread_mutex_unlock(&status_mutex);
+      local_status = 0;
    }
 
    deflateEnd(&strm);
 
-   /* When called from directory processing mode, close the file descriptor and 
-      add back to the threadpool */
+   pthread_mutex_lock(&bucket_mutex);
+      for (i = 0; i <= 4096; i++)
+         buckets[i] += local_buckets[i];
+   pthread_mutex_unlock(&bucket_mutex);
+
+   if (measure_padding) {
+      pthread_mutex_lock(&padding_mutex);
+         for (i = 0; i <= 4096; i++)
+            padding_buckets[i] += local_padding[i];
+      pthread_mutex_unlock(&padding_mutex);
+   }
+
+   if (measure_entropy) {
+      pthread_mutex_lock(&symbol_table_mutex);
+         for (i = 0; i < 256; i++)
+            symbol_table[i] += local_symbols[i];
+      pthread_mutex_unlock(&symbol_table_mutex);
+   }
+
    if (close_fd) {
       close(fd);
-      if (t_ops)
-         free(t_ops);
+      free(t_ops);
       pthread_mutex_lock(&threadpool_mutex);
          threadpool--;
       pthread_mutex_unlock(&threadpool_mutex);
    }
 
-   if (ibuff)
-      free(ibuff);
-   if (zbuff)
-      free(zbuff);
-   if (obuff)
-      free(obuff);
+   free(ibuff);
+   free(zbuff);
+   free(obuff);
 
    return NULL;
 }
 
-void print_results(uint64_t size_in_bytes) {
+void print_results(void) {
 
    uint32_t i, j, k;
    uint64_t bucket_sum = 0;
@@ -454,45 +407,30 @@ void print_results(uint64_t size_in_bytes) {
    printf("Incompressible Sectors   : %lu\n", buckets[4096]);
    if (measure_entropy)
       printf("Shannon Entropy (8-bit)  : %.2f\n", entropy);
+   if (measure_padding) {
+      uint64_t total_padding_bytes = 0;
+      for ( i = 0; i <= 4096; i++ )
+         total_padding_bytes += padding_buckets[i] * i;
+      printf("Trailing Zero Padding    : %lu bytes (%.2f%% of data analyzed)\n",
+             total_padding_bytes,
+             bucket_sum_uncompressed > 0 ? ((float)total_padding_bytes/bucket_sum_uncompressed)*100 : 0.0);
+   }
 
    if (dirmode_files && detect_file_headers) {
       printf("\n");
       printf("File Signature Analysis:\n\n");
-      printf("   %lu files without compression detected (%.2f %% of files, %.2f %% of data analyzed)\n", 
-                 signatures.unknown, (((float)signatures.unknown)/dirmode_files)*100, (((float)bytes.unknown)/bucket_sum_uncompressed)*100);
+      printf("   %lu files without compression detected (%.2f %% of files, %.2f %% of data analyzed)\n",
+                 formats[FMT_UNKNOWN].sig_count,
+                 ((float)formats[FMT_UNKNOWN].sig_count/dirmode_files)*100,
+                 ((float)formats[FMT_UNKNOWN].byte_count/bucket_sum_uncompressed)*100);
       printf("   Files with compression detected...\n\n");
 
       printf("   File Type : # of Files   [ %% of Data ]\n");
       printf("   --------------------------------------\n");
-      printf("          7z : %-12lu [ %7.2f %% ]\n", signatures.z7z, (((float)bytes.z7z)/bucket_sum_uncompressed)*100);
-      printf("         aac : %-12lu [ %7.2f %% ]\n", signatures.aac, (((float)bytes.aac)/bucket_sum_uncompressed)*100);
-      printf("         avi : %-12lu [ %7.2f %% ]\n", signatures.avi, (((float)bytes.avi)/bucket_sum_uncompressed)*100);
-      printf("        avif : %-12lu [ %7.2f %% ]\n", signatures.avif, (((float)bytes.avif)/bucket_sum_uncompressed)*100);
-      printf("         bpg : %-12lu [ %7.2f %% ]\n", signatures.bpg, (((float)bytes.bpg)/bucket_sum_uncompressed)*100);
-      printf("         bz2 : %-12lu [ %7.2f %% ]\n", signatures.bz2, (((float)bytes.bz2)/bucket_sum_uncompressed)*100);
-      printf("        flac : %-12lu [ %7.2f %% ]\n", signatures.flac, (((float)bytes.flac)/bucket_sum_uncompressed)*100);
-      printf("         flv : %-12lu [ %7.2f %% ]\n", signatures.flv, (((float)bytes.flv)/bucket_sum_uncompressed)*100);
-      printf("         gif : %-12lu [ %7.2f %% ]\n", signatures.gif, (((float)bytes.gif)/bucket_sum_uncompressed)*100);
-      printf("        gzip : %-12lu [ %7.2f %% ]\n", signatures.gzip, (((float)bytes.gzip)/bucket_sum_uncompressed)*100);
-      printf("        heif : %-12lu [ %7.2f %% ]\n", signatures.heif, (((float)bytes.heif)/bucket_sum_uncompressed)*100);
-      printf("        jpeg : %-12lu [ %7.2f %% ]\n", signatures.jpeg, (((float)bytes.jpeg)/bucket_sum_uncompressed)*100);
-      printf("    jpeg2000 : %-12lu [ %7.2f %% ]\n", signatures.jpeg2000, (((float)bytes.jpeg2000)/bucket_sum_uncompressed)*100);
-      printf("         lz4 : %-12lu [ %7.2f %% ]\n", signatures.lz4, (((float)bytes.lz4)/bucket_sum_uncompressed)*100);
-      printf("         mov : %-12lu [ %7.2f %% ]\n", signatures.mov, (((float)bytes.mov)/bucket_sum_uncompressed)*100);
-      printf("         mp3 : %-12lu [ %7.2f %% ]\n", signatures.mp3, (((float)bytes.mp3)/bucket_sum_uncompressed)*100);
-      printf("         mp4 : %-12lu [ %7.2f %% ]\n", signatures.mp4, (((float)bytes.mp4)/bucket_sum_uncompressed)*100);
-      printf("        mpeg : %-12lu [ %7.2f %% ]\n", signatures.mpeg, (((float)bytes.mpeg)/bucket_sum_uncompressed)*100);
-      printf("         mkv : %-12lu [ %7.2f %% ]\n", signatures.mkv, (((float)bytes.mkv)/bucket_sum_uncompressed)*100);
-      printf("         ogg : %-12lu [ %7.2f %% ]\n", signatures.ogg, (((float)bytes.ogg)/bucket_sum_uncompressed)*100);
-      printf("         png : %-12lu [ %7.2f %% ]\n", signatures.png, (((float)bytes.png)/bucket_sum_uncompressed)*100);
-      printf("         rar : %-12lu [ %7.2f %% ]\n", signatures.rar, (((float)bytes.rar)/bucket_sum_uncompressed)*100);
-      printf("        tiff : %-12lu [ %7.2f %% ]\n", signatures.tiff, (((float)bytes.tiff)/bucket_sum_uncompressed)*100);
-      printf("         wav : %-12lu [ %7.2f %% ]\n", signatures.wav, (((float)bytes.wav)/bucket_sum_uncompressed)*100);
-      printf("        webp : %-12lu [ %7.2f %% ]\n", signatures.webp, (((float)bytes.webp)/bucket_sum_uncompressed)*100);
-      printf("         wma : %-12lu [ %7.2f %% ]\n", signatures.wma, (((float)bytes.wma)/bucket_sum_uncompressed)*100);
-      printf("          xz : %-12lu [ %7.2f %% ]\n", signatures.xz, (((float)bytes.xz)/bucket_sum_uncompressed)*100);
-      printf("         zip : %-12lu [ %7.2f %% ]\n", signatures.zip, (((float)bytes.zip)/bucket_sum_uncompressed)*100);
-      printf("        zstd : %-12lu [ %7.2f %% ]\n", signatures.zstd, (((float)bytes.zstd)/bucket_sum_uncompressed)*100);
+      for (int f = 1; f < FMT_COUNT; f++) {
+         printf("   %9s : %-12lu [ %7.2f %% ]\n", formats[f].name, formats[f].sig_count,
+                ((float)formats[f].byte_count/bucket_sum_uncompressed)*100);
+      }
    }
 
    /* Get the histogram entry with the biggest value */
@@ -531,19 +469,47 @@ void print_results(uint64_t size_in_bytes) {
    } else 
       printf("\nCompression ratio with ScaleFlux cannot be estimated because the drive is empty\n");
 
+   if (measure_padding) {
+      uint64_t pad_tally = 0;
+      uint64_t max_pad_tally = 0;
+      for (i = 0; i <= 4096; i++ ) {
+         pad_tally += padding_buckets[i];
+         if ((i+1) % HISTOGRAM_RESOLUTION == 0 || i == 4096) {
+            if (pad_tally > max_pad_tally)
+               max_pad_tally = pad_tally;
+            pad_tally = 0;
+         }
+      }
+      if (max_pad_tally > 0) {
+         printf("\nPadding Histogram:\n\n");
+         pad_tally = 0;
+         for (i = 0; i <= 4096; i++ ) {
+            pad_tally += padding_buckets[i];
+            if ((i+1) % HISTOGRAM_RESOLUTION == 0 || i == 4096) {
+               printf("   <= %4u Bytes: ", i);
+               hash_percent = (float) pad_tally / max_pad_tally;
+               hash_count = hash_percent * 50;
+               for (j = 0; j < (int) hash_count; j++)
+                  printf("#");
+               if ( hash_count < 1 )
+                  printf("#");
+               printf(" %lu\n", pad_tally);
+               pad_tally = 0;
+            }
+         }
+      }
+   }
+
    printf("\n");
    return;
 }
 
-
 int compress_dir_callback(const char* path, const struct stat* st, int32_t flag, struct FTW *ftwbuf) {
 
-   int32_t fd;
-    
-   pthread_t* thread_id;
-   compress_thread_t* ops;
+   int32_t fd = -1;
+   pthread_t thread_id;
+   compress_thread_t* ops = NULL;
 
-   /* Skip special files */
    switch (st->st_mode & S_IFMT) {
       case S_IFDIR:
       case S_IFCHR:
@@ -553,66 +519,54 @@ int compress_dir_callback(const char* path, const struct stat* st, int32_t flag,
          return EXIT_SUCCESS;
    }
 
-   thread_id = malloc(sizeof(pthread_t));
-   ops       = malloc(sizeof(compress_thread_t));
-
-   if (!thread_id || !ops) {
+   ops = malloc(sizeof(compress_thread_t));
+   if (!ops) {
       fprintf(stderr, "Could not allocate memory for threads\n");
-      if (thread_id)
-         free(thread_id);
-      if (ops)
-         free(ops);
       return EXIT_FAILURE;
    }
 
-   fd = open(path, O_RDONLY);   // Read-only
-
+   fd = open(path, O_RDONLY);
    if (fd == -1) {
       fprintf(stderr, "Unable to open %s for reading (%s)\n", path, strerror(errno));
-      if (thread_id)
-         free(thread_id);
-      if (ops)
-         free(ops);
-      close(fd);
-      return EXIT_FAILURE;
+      goto cleanup;
    }
 
    if (detect_file_headers) {
       if (detect_compression(fd, st->st_size)) {
-         fprintf(stderr, "Unable to reliably reset seek position in file %s (%s)\n", path, strerror(errno));
-         if (thread_id)
-            free(thread_id);
-         if (ops)
-            free(ops);
-         close(fd);
-         return EXIT_FAILURE;
+         fprintf(stderr, "Unable to read file header from %s (%s)\n", path, strerror(errno));
+         goto cleanup;
       }
    }
 
    ops->fd       = fd;
-   ops->close_fd = 1;   // Request compression thread to close the file descriptor
-   ops->bytes    = st->st_size;   // Compress entire file
-   ops->offset   = 0; 
+   ops->close_fd = 1;
+   ops->bytes    = st->st_size;
+   ops->offset   = 0;
 
-   /* Wait until there is room in the threadpool */ 
-   while (threadpool >= thread_cnt)
+   while (1) {
+      pthread_mutex_lock(&threadpool_mutex);
+      if (threadpool < thread_cnt)
+         break;
+      pthread_mutex_unlock(&threadpool_mutex);
       usleep(1000);
-
-   /* Take a credit from the threadpool and launch a thread */
-   pthread_mutex_lock(&threadpool_mutex);
-      pthread_create(thread_id, NULL, &compress_thread, ops);
-      threadpool++;
-      pthread_detach(*thread_id);
+   }
+   pthread_create(&thread_id, NULL, &compress_thread, ops);
+   threadpool++;
+   pthread_detach(thread_id);
    pthread_mutex_unlock(&threadpool_mutex);
 
-   /* Increment counters */
-   dirmode_bytes += ops->bytes;
-   dirmode_files += 1;
-
-   if (thread_id)
-      free(thread_id);
+   pthread_mutex_lock(&status_mutex);
+      dirmode_bytes += ops->bytes;
+      dirmode_files += 1;
+   pthread_mutex_unlock(&status_mutex);
 
    return 0;
+
+cleanup:
+   free(ops);
+   if (fd != -1)
+      close(fd);
+   return EXIT_FAILURE;
 }
 
 int compress_dir(char* path, struct stat st) {
@@ -630,12 +584,20 @@ int compress_dir(char* path, struct stat st) {
       return EXIT_FAILURE;
    }
 
-   sleep(2);
+   while (1) {
+      pthread_mutex_lock(&threadpool_mutex);
+      if (threadpool <= 0) {
+         pthread_mutex_unlock(&threadpool_mutex);
+         break;
+      }
+      pthread_mutex_unlock(&threadpool_mutex);
+      usleep(10000);
+   }
 
    run = 0;   // Trigger to exit monitoring thread
    pthread_join(monitor_thread_id, NULL); 
 
-   print_results(dirmode_bytes);
+   print_results();
 
    return EXIT_SUCCESS;
 }
@@ -643,7 +605,7 @@ int compress_dir(char* path, struct stat st) {
 int compress_blk_or_file(char* path, struct stat st, int32_t isblk) {
 
    uint32_t i;
-   uint32_t fd;
+   int32_t fd;
 
    int64_t size_in_bytes = 0;
    int64_t bytes_per_thread = 0;
@@ -667,7 +629,11 @@ int compress_blk_or_file(char* path, struct stat st, int32_t isblk) {
    }
 
    if (isblk) {
-      ioctl(fd, BLKGETSIZE64, &size_in_bytes); 
+      if (ioctl(fd, BLKGETSIZE64, &size_in_bytes) == -1) {
+         fprintf(stderr, "Unable to get block device size (%s)\n", strerror(errno));
+         close(fd);
+         return EXIT_FAILURE;
+      }
    } else {
       size_in_bytes = st.st_size;
    }
@@ -688,7 +654,8 @@ int compress_blk_or_file(char* path, struct stat st, int32_t isblk) {
 
    if (!isblk && detect_file_headers) {
       if (detect_compression(fd, st.st_size)) {
-         fprintf(stderr, "Unable to reliably reset seek position in file %s (%s)\n", path, strerror(errno));
+         fprintf(stderr, "Unable to read file header from %s (%s)\n", path, strerror(errno));
+         close(fd);
          return EXIT_FAILURE;
      }
   }
@@ -712,10 +679,8 @@ int compress_blk_or_file(char* path, struct stat st, int32_t isblk) {
 
    if (!thread_id || !ops) {
       fprintf(stderr, "Could not allocate memory for threads\n");
-      if (thread_id)
-         free(thread_id);  
-      if (ops)
-         free(ops); 
+      free(thread_id);
+      free(ops);
       close(fd);
       return EXIT_FAILURE;
    }
@@ -745,17 +710,14 @@ int compress_blk_or_file(char* path, struct stat st, int32_t isblk) {
    run = 0;   // Trigger to exit monitoring thread
    pthread_join(monitor_thread_id, NULL); 
 
-   print_results(size_in_bytes);
+   print_results();
 
-   if (thread_id)
-      free(thread_id);  
-   if (ops)
-      free(ops);  
+   free(thread_id);
+   free(ops);
    close(fd);
 
    return EXIT_SUCCESS;
 } 
-
 
 int main(int argc, char* argv[]) {
 
@@ -766,20 +728,23 @@ int main(int argc, char* argv[]) {
    if (argc <= 2) {
       fprintf(stderr, "Reads an entire disk, single file, or directory (recursively)");
       fprintf(stderr, " and estimates compressibility on ScaleFlux devices.\n\n");
-      fprintf(stderr, "\tUsage: %s -d <File, Directory, or Block Device> -t <Threads>\n", argv[0]);
+      fprintf(stderr, "\tUsage: %s -d <File, Directory, or Block Device> -t <Threads>\n\n", argv[0]);
       fprintf(stderr, "Advanced flags:\n\n");
       fprintf(stderr, "   -q : Estimate using 512-byte quantized compression\n");
       fprintf(stderr, "   -e : Measure data entropy\n");
-      fprintf(stderr, "   -c : Show statistics for pre-compressed file formats (file or direcory mode only)\n\n");
+      fprintf(stderr, "   -c : Show statistics for pre-compressed file formats (file or direcory mode only)\n");
+      fprintf(stderr, "   -p : Measure trailing zero padding per 4kB block\n\n");
       exit(EXIT_FAILURE);
    } else {
-      while ((args = getopt(argc, argv, "d:t:qec")) != -1) {
+      while ((args = getopt(argc, argv, "d:t:qecp")) != -1) {
          switch (args) {
             case 'd':   // File, directory or disk to test
                path = optarg;
                break;
             case 't':   // Number of compression threads
                thread_cnt = atoi(optarg);
+               if (thread_cnt < 1)
+                  thread_cnt = 1;
                break;
             case 'q':
                quantized_compression = 1;
@@ -789,6 +754,9 @@ int main(int argc, char* argv[]) {
                break;
             case 'c':
                detect_file_headers = 1;
+               break;
+            case 'p':
+               measure_padding = 1;
                break;
             case '?':
                fprintf(stderr, "Unknown option %c\n", optopt);
@@ -805,6 +773,7 @@ int main(int argc, char* argv[]) {
    }
 
    pthread_mutex_init(&bucket_mutex, NULL);
+   pthread_mutex_init(&padding_mutex, NULL);
    pthread_mutex_init(&status_mutex, NULL);
    pthread_mutex_init(&threadpool_mutex, NULL);
    pthread_mutex_init(&symbol_table_mutex, NULL);
@@ -838,6 +807,7 @@ int main(int argc, char* argv[]) {
    }
 
    pthread_mutex_destroy(&bucket_mutex);
+   pthread_mutex_destroy(&padding_mutex);
    pthread_mutex_destroy(&status_mutex);
    pthread_mutex_destroy(&threadpool_mutex);
    pthread_mutex_destroy(&symbol_table_mutex);
