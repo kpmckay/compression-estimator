@@ -307,7 +307,8 @@ void* compress_thread(void* t_ops) {
             int pad = 0;
             for (int p = bytes_to_compress - 1; p >= 0 && ibuff[(4096*i) + p] == 0; p--)
                pad++;
-            local_padding[pad]++;
+            if (pad >= HISTOGRAM_RESOLUTION)
+               local_padding[pad]++;
          }
 
          local_status += bytes_to_compress;
@@ -472,20 +473,20 @@ void print_results(void) {
    if (measure_padding) {
       uint64_t pad_tally = 0;
       uint64_t max_pad_tally = 0;
-      for (i = 0; i <= 4096; i++ ) {
+      for (i = HISTOGRAM_RESOLUTION+1; i <= 4096; i++ ) {
          pad_tally += padding_buckets[i];
-         if ((i+1) % HISTOGRAM_RESOLUTION == 0 || i == 4096) {
+         if (i % HISTOGRAM_RESOLUTION == 0) {
             if (pad_tally > max_pad_tally)
                max_pad_tally = pad_tally;
             pad_tally = 0;
          }
       }
       if (max_pad_tally > 0) {
-         printf("\nPadding Histogram:\n\n");
+         printf("\nPadding Histogram (minimum %d trailing zero bytes):\n\n", HISTOGRAM_RESOLUTION);
          pad_tally = 0;
-         for (i = 0; i <= 4096; i++ ) {
+         for (i = HISTOGRAM_RESOLUTION+1; i <= 4096; i++ ) {
             pad_tally += padding_buckets[i];
-            if ((i+1) % HISTOGRAM_RESOLUTION == 0 || i == 4096) {
+            if (i % HISTOGRAM_RESOLUTION == 0) {
                printf("   <= %4u Bytes: ", i);
                hash_percent = (float) pad_tally / max_pad_tally;
                hash_count = hash_percent * 50;
